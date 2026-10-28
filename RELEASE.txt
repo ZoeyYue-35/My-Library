@@ -1,0 +1,28 @@
+MY LIBRARY — CLEAN LOCAL RELEASE
+Release: 2026-10-28
+
+Included features
+- Local account registration and sign-in
+- Resume Studio: custom directions, add/delete tracks, file uploads, and version history
+- Knowledge Library: resume sources, CV templates, and supporting-material uploads
+- Story Builder: editable, grounded STAR answers and confirmed Stories Library
+- Mock Interview: JD-aware questions, adaptive follow-ups, voice-to-text, immediate/live coaching or full-session review
+- Mock history: each completed interview saves automatically; reopen its questions, answers, scorecards, and summary
+- Confirmed Mock sessions: explicitly add a completed Mock to Confirmed answers, then reopen its full transcript and feedback from that library
+- New-user quick tour: guides first-time accounts from Story Builder to STAR Story and Mock Interview, with next/skip controls
+- GitHub-ready organization: frontend/, backend/, migrations/, cloud/, and source verification workflow
+
+Privacy
+- This package intentionally excludes storage/, account records, uploaded files, and API-key encryption material.
+- Each person starts with a blank workspace and supplies their own OpenAI API key only if they choose to use Story Builder.
+- A connected key is encrypted server-side and exposed back to the browser only as a masked hint. Never commit a real key or storage/ to Git.
+
+Cloud status
+- cloud/Dockerfile is a single-instance staging package only.
+- migrations/001_initial_schema.sql is a Postgres blueprint, not a live database or a copy of local user data.
+- A public release still needs managed Postgres, private object storage, durable sessions, HTTPS, and a host secret manager.
+
+Launch
+- macOS: double-click START_MY_LIBRARY.command.
+- Or run: MY_LIBRARY_PORT=8011 python3 server.py
+- Open: http://127.0.0.1:8011

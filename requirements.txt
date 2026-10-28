@@ -1,0 +1,3 @@
+# Compatibility entry point for local installs and simple cloud builders.
+# The canonical dependency list lives beside the backend source.
+-r backend/requirements.txt
