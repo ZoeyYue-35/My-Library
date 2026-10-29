@@ -5,6 +5,7 @@
   const toast = document.getElementById("toast");
   const state = {
     token: localStorage.getItem("my-library-session") || "",
+    isCloud: false,
     account: null,
     items: [],
     stories: [],
@@ -34,6 +35,8 @@
     modalItem: null,
     onboardingStep: -1,
   };
+  let workspaceStateSaveTimer = 0;
+  let workspaceStateSaveQueue = Promise.resolve();
 
   const categoryMeta = {
     resume: { tab: "sources", eyebrow: "ORIGINAL RESUME SOURCE", label: "Resume source", description: "DOCX/PDF text was extracted locally. This source stays reviewable and is available to your Resume Studio history." },
@@ -99,6 +102,15 @@
   }
 
   async function boot() {
+    try {
+      const healthResponse = await fetch("/api/health");
+      const health = await healthResponse.json();
+      state.isCloud = health.mode === "cloud";
+    } catch (_) { /* Sign-in still explains that the service could not be reached. */ }
+    if (state.isCloud) {
+      localStorage.removeItem("my-library-session");
+      state.token = "";
+    }
     if (state.token) {
       try {
         const session = await api("/api/session");
@@ -106,6 +118,7 @@
           state.account = session.account;
           loadStoryJobDescription();
           await refreshAll();
+          await restoreCloudWorkspaceState();
           state.onboardingStep = state.account.showOnboarding ? 0 : -1;
           render();
           return;
@@ -130,13 +143,64 @@
   }
 
   function loadStoryJobDescription() {
+    if (state.isCloud) {
+      state.storyJobDescription = "";
+      if (state.account) localStorage.removeItem(storyJobStorageKey());
+      return;
+    }
     state.storyJobDescription = localStorage.getItem(storyJobStorageKey()) || "";
   }
 
   function saveStoryJobDescription(value) {
     state.storyJobDescription = String(value || "").slice(0, 16000);
-    localStorage.setItem(storyJobStorageKey(), state.storyJobDescription);
+    if (state.isCloud) queueWorkspaceStateSave();
+    else localStorage.setItem(storyJobStorageKey(), state.storyJobDescription);
   }
+
+  function workspaceStatePayload() {
+    return {
+      storyJobDescription: state.storyJobDescription,
+      workspaceState: {
+        storyChat: state.storyChat,
+        mockInterview: state.mockInterview,
+        mockAnswerDraft: state.mockAnswerDraft,
+      },
+    };
+  }
+
+  function queueWorkspaceStateSave() {
+    if (!state.isCloud || !state.account) return;
+    window.clearTimeout(workspaceStateSaveTimer);
+    workspaceStateSaveTimer = window.setTimeout(function () {
+      const payload = workspaceStatePayload();
+      workspaceStateSaveQueue = workspaceStateSaveQueue.catch(function () {}).then(function () {
+        return api("/api/user-state", { method: "POST", body: JSON.stringify(payload) });
+      }).catch(function (error) {
+        showToast("Your latest draft could not be saved to your account. " + error.message, true);
+      });
+    }, 400);
+  }
+
+  async function restoreCloudWorkspaceState() {
+    if (!state.isCloud) return;
+    const saved = await api("/api/user-state");
+    state.storyJobDescription = saved.storyJobDescription || "";
+    const workspace = saved.workspaceState || {};
+    state.storyChat = Array.isArray(workspace.storyChat) ? workspace.storyChat : [];
+    state.mockInterview = workspace.mockInterview && typeof workspace.mockInterview === "object" ? workspace.mockInterview : null;
+    state.mockAnswerDraft = String(workspace.mockAnswerDraft || "");
+  }
+
+  window.addEventListener("pagehide", function () {
+    if (!state.isCloud || !state.account) return;
+    window.clearTimeout(workspaceStateSaveTimer);
+    fetch("/api/user-state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(workspaceStatePayload()),
+      keepalive: true,
+    });
+  });
 
   function trackOptions(selected, includeAll) {
     const first = includeAll
@@ -205,6 +269,14 @@
   function renderAuth() {
     const isRegister = state.authMode === "register";
     app.innerHTML = '<section class="auth-shell"><div><p class="brand-kicker">MY LIBRARY / LOCAL-FIRST</p><h1 class="auth-title">Your source<br/>of truth.</h1><p class="auth-copy">A private workspace for resume versions, supporting material, and the stories you want to tell with confidence.</p><ul class="promise-list"><li>Keep original files and a traceable version history.</li><li>Separate templates from factual evidence.</li><li>Build STAR answers from your own verified material.</li></ul></div><section class="auth-card"><div class="auth-tabs"><button class="auth-tab ' + (isRegister ? "active" : "") + '" type="button" data-auth-mode="register">Create account</button><button class="auth-tab ' + (!isRegister ? "active" : "") + '" type="button" data-auth-mode="login">Sign in</button></div><form class="auth-form" id="auth-form"><h2>' + (isRegister ? "Create your local workspace" : "Welcome back") + '</h2>' + (isRegister ? '<label>Name<input name="name" autocomplete="name" required /></label>' : "") + '<label>Email<input name="email" type="email" autocomplete="email" autocapitalize="none" required /></label><label>Local password<input name="password" type="password" autocomplete="' + (isRegister ? "new-password" : "current-password") + '" minlength="8" placeholder="At least 8 characters" required /></label>' + (isRegister ? '<label>Confirm local password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required /></label>' : "") + '<button class="primary" type="submit">' + (isRegister ? "Create local account" : "Sign in") + '</button><p id="auth-feedback" class="auth-feedback" role="alert"' + (state.authFeedback ? "" : " hidden") + '>' + escapeHtml(state.authFeedback) + '</p><p class="fine-print">This password is for My Library only. Any password with 8+ characters works; browser-generated passwords are optional.</p></form></section></section>';
+    if (state.isCloud) {
+      app.innerHTML = app.innerHTML
+        .replace("MY LIBRARY / LOCAL-FIRST", "MY LIBRARY / PRIVATE WORKSPACE")
+        .replace("Create your local workspace", "Create your account workspace")
+        .replaceAll("Local password", "Account password")
+        .replaceAll("local password", "account password")
+        .replaceAll("local account", "account");
+    }
     document.querySelectorAll("[data-auth-mode]").forEach(function (button) { button.addEventListener("click", function () { state.authMode = button.dataset.authMode; state.authFeedback = ""; renderAuth(); }); });
     document.getElementById("auth-form").addEventListener("submit", submitAuth);
   }
@@ -222,11 +294,13 @@
     button.disabled = true;
     try {
       const response = await api("/api/auth/" + (state.authMode === "register" ? "register" : "login"), { method: "POST", body: JSON.stringify(payload) });
-      state.token = response.token;
+      state.token = response.token || "";
       state.account = response.account;
-      localStorage.setItem("my-library-session", state.token);
+      if (state.token) localStorage.setItem("my-library-session", state.token);
+      else localStorage.removeItem("my-library-session");
       loadStoryJobDescription();
       await refreshAll();
+      await restoreCloudWorkspaceState();
       state.view = "studio";
       state.onboardingStep = state.account.showOnboarding ? 0 : -1;
       render();
@@ -235,12 +309,12 @@
   }
 
   async function signOut(showMessage) {
-    try { if (state.token) await api("/api/auth/logout", { method: "POST", body: "{}" }); } catch (_) { /* Local cleanup continues. */ }
+    try { if (state.token || state.isCloud) await api("/api/auth/logout", { method: "POST", body: "{}" }); } catch (_) { /* Local cleanup continues. */ }
     stopMockRecording(true);
     localStorage.removeItem("my-library-session");
     state.token = ""; state.account = null; state.items = []; state.stories = []; state.mockHistories = []; state.storyChat = []; state.mockInterview = null; state.selectedMockHistory = null; state.mockAnswerDraft = ""; state.selectedVersion = null; state.storyJobDescription = ""; state.onboardingStep = -1;
     renderAuth();
-    if (showMessage) showToast("Signed out. Your local library remains on this computer.");
+    if (showMessage) showToast(state.isCloud ? "Signed out. Your saved workspace remains in your account." : "Signed out. Your local library remains on this computer.");
   }
 
   function resumeItems(trackId) {
@@ -284,7 +358,7 @@
       : '<div class="studio-upload is-disabled"><span class="draft-label">ADD A RESUME VERSION</span><p>Create a direction before adding a resume version.</p></div>';
     const trackCreator = '<form id="studio-track-form" class="studio-track-form"><span class="draft-label">NEW DIRECTION</span><label>What should this track be called?<input name="name" placeholder="e.g. Product management" required /></label><button class="secondary" type="submit">Add new track</button></form>';
     const content = pageHeader("MY LIBRARY / VERSION CONTROL", "Resume studio", "Keep independent resume directions and their full version history. Only a version you explicitly confirm becomes current.") + '<div class="studio-layout"><aside class="section-card studio-sidebar"><div class="card-head"><div><h2>Resume directions</h2><p>Choose a track, then review its saved versions.</p></div></div><div class="studio-track-list">' + branches + '</div>' + trackCreator + upload + '<div class="card-head compact"><div><h3>Version history</h3><p>Older versions are never overwritten.</p></div></div><div class="version-stack">' + history + '</div></aside><main class="section-card studio-main">' + overview + '</main></div>';
-    renderShell(content);
+    renderShell(state.isCloud ? content.replace("Saved locally for this account.", "Saved to your cloud account.") : content);
     document.querySelectorAll("[data-studio-track]").forEach(function (button) { button.addEventListener("click", function () { state.studioTrack = button.dataset.studioTrack; state.selectedVersion = null; render(); }); });
     document.querySelectorAll("[data-delete-track]").forEach(function (button) { button.addEventListener("click", function () { deleteTrack(button.dataset.deleteTrack); }); });
     document.querySelectorAll("[data-select-version]").forEach(function (button) { button.addEventListener("click", function () { state.selectedVersion = button.dataset.selectVersion; render(); }); });
@@ -524,6 +598,7 @@
     const workspace = selectedHistory ? renderSavedMockHistory(selectedHistory) : (state.storyLaunchMenu ? renderStoryLauncher(aiReady) : (state.storyTool === "mock" ? renderMockWorkspace(aiReady, storyBusy) : renderStarWorkspace(aiReady, storyBusy)));
     const content = pageHeader("MY LIBRARY / INTERVIEW PRACTICE", "Story builder", "Use your own source material for a polished STAR answer or a realistic, JD-aware mock interview.") + storyToolTabs() + '<div class="stories-layout"><aside class="story-side-column">' + jobDescriptionPanel() + '<section class="section-card stories-library"><div class="card-head"><div><span class="draft-label">STORIES LIBRARY</span><h2>Confirmed answers</h2><p>Reusable answers you have reviewed and approved.</p></div><span class="story-count">' + state.stories.length + '</span></div>' + storyRows() + '</section><section class="section-card stories-library mock-history-card"><div class="card-head"><div><span class="draft-label">MOCK HISTORY</span><h2>Saved sessions</h2><p>Reopen past interview questions, answers, and feedback.</p></div><span class="story-count">' + state.mockHistories.length + '</span></div>' + mockHistoryRows() + '</section></aside><main class="stories-workspace">' + workspace + (state.storyTool === "star" && !selectedHistory ? storyDetail() : "") + '</main></div>';
     renderShell(content);
+    queueWorkspaceStateSave();
     document.querySelectorAll("[data-story-tool]").forEach(function (button) { button.addEventListener("click", function () {
       if (state.storyPending) return;
       if (state.onboardingStep === 1 && button.dataset.storyTool === "star") { advanceOnboarding(); return; }
@@ -596,6 +671,11 @@
   function bindMockInterview() {
     const setup = document.getElementById("mock-setup-form");
     if (setup) setup.addEventListener("submit", startMockInterview);
+    const answerField = document.getElementById("mock-answer");
+    if (answerField) answerField.addEventListener("input", function () {
+      state.mockAnswerDraft = answerField.value;
+      queueWorkspaceStateSave();
+    });
     const answer = document.querySelector("[data-submit-mock-answer]");
     if (answer) answer.addEventListener("click", submitMockAnswer);
     const hint = document.querySelector("[data-mock-hint]");
@@ -630,12 +710,45 @@
     const configured = Boolean(connection.configured);
     const connectionCard = '<section class="section-card ai-connection-card"><div class="card-head"><div><span class="draft-label">STORY BUILDER</span><h2>Your OpenAI connection</h2><p>Each My Library account can supply its own OpenAI Platform API key. A saved key is encrypted locally and never returned to the browser.</p></div><span class="connection-state ' + (configured ? 'connected' : 'not-connected') + '">' + (configured ? 'Connected' : 'Not connected') + '</span></div>' + (configured ? '<div class="connection-summary"><strong>OpenAI</strong><span>gpt-5-mini · ' + escapeHtml(connection.keyHint || "Masked key") + '</span><small>Updated ' + escapeHtml(formatDate(connection.updatedAt) || "recently") + '</small></div>' : '<p class="connection-empty">Story Builder stays off until this account connects a key. Resume versions, source uploads, and confirmed stories are still available.</p>') + '<form id="ai-connection-form" class="settings-form"><label>' + (configured ? 'Replace OpenAI API key' : 'OpenAI API key') + '<input name="apiKey" type="password" minlength="12" required autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Paste your OpenAI API key here" /></label><p class="api-key-note">My Library uses gpt-5-mini automatically, so there is no provider or model to choose. When you save, it validates the key with OpenAI before encrypting it under this account. That validation sends no resume, JD, or library content.</p><div class="connection-actions"><button class="primary" type="submit">' + (configured ? 'Replace key' : 'Connect key') + '</button>' + (configured ? '<button class="secondary danger-outline" type="button" id="disconnect-ai">Disconnect key</button>' : '') + '</div></form></section>';
     const content = pageHeader("MY LIBRARY / LOCAL SETTINGS", "Workspace settings", "Role directions organize your resume history and limit which materials a Story Builder request will use.") + '<div class="settings-layout">' + connectionCard + '<section class="section-card"><h2>Role directions</h2><p class="panel-copy">New accounts begin empty so you can define your own directions. Existing directions stay unchanged. You can also add one directly in Resume Studio.</p>' + (tracks.length ? tracks.map(function (track) { return '<div class="setting-row"><div><h3><span class="track-dot ' + escapeHtml(track.color) + '"></span> ' + escapeHtml(track.name) + '</h3><p>' + state.items.filter(function (item) { return item.trackId === track.id; }).length + ' linked source(s)</p></div></div>'; }).join("") : '<div class="studio-empty-list">No directions yet. Create one here or in Resume Studio.</div>') + '<form id="track-form" class="form-actions"><label>New direction<input name="name" placeholder="e.g. Consulting" required /></label><button class="secondary" type="submit">Add direction</button></form></section><section class="section-card"><h2>Local password</h2><p class="panel-copy">Use this after signing in if you originally accepted a browser-generated password.</p><form id="password-form" class="settings-form"><label>Current local password<input name="currentPassword" type="password" autocomplete="current-password" required /></label><label>New local password<input name="newPassword" type="password" autocomplete="new-password" minlength="8" required /></label><label>Confirm new password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required /></label><button class="secondary" type="submit">Change local password</button></form></section></div>';
-    renderShell(content);
+    const settingsContent = state.isCloud
+      ? content.replace("A saved key is encrypted locally and never returned to the browser.", "Your key is encrypted before it is stored in the managed database and is never returned to the browser.").replace("MY LIBRARY / LOCAL SETTINGS", "MY LIBRARY / ACCOUNT SETTINGS").replaceAll("Local password", "Account password").replaceAll("local password", "account password")
+      : content;
+    renderShell(settingsContent);
+    const deleteCard = document.createElement("section");
+    deleteCard.className = "section-card account-danger-zone";
+    deleteCard.innerHTML = '<h2>Delete account</h2><p>This permanently removes your account, saved stories, interview history, uploaded files, and connected API key.</p><form id="delete-account-form" class="settings-form"><label>Current password<input name="password" type="password" autocomplete="current-password" required /></label><label>Type DELETE to confirm<input name="confirmation" required autocomplete="off" /></label><button class="secondary danger-outline" type="submit">Delete my account and data</button></form>';
+    document.querySelector(".settings-layout").appendChild(deleteCard);
     document.getElementById("ai-connection-form").addEventListener("submit", saveAiConnection);
     const disconnect = document.getElementById("disconnect-ai");
     if (disconnect) disconnect.addEventListener("click", deleteAiConnection);
     document.getElementById("track-form").addEventListener("submit", addTrack);
     document.getElementById("password-form").addEventListener("submit", changePassword);
+    document.getElementById("delete-account-form").addEventListener("submit", deleteAccount);
+  }
+
+  async function deleteAccount(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    if (form.get("confirmation") !== "DELETE") {
+      showToast("Type DELETE exactly to confirm account removal.", true);
+      return;
+    }
+    if (!window.confirm("Permanently delete this account and all saved data? This cannot be undone.")) return;
+    try {
+      await api("/api/auth/account", { method: "POST", body: JSON.stringify({ password: form.get("password") }) });
+      localStorage.removeItem("my-library-session");
+      state.token = "";
+      state.account = null;
+      state.items = [];
+      state.stories = [];
+      state.mockHistories = [];
+      state.storyChat = [];
+      state.mockInterview = null;
+      state.mockAnswerDraft = "";
+      state.storyJobDescription = "";
+      renderAuth();
+      showToast("Your account and saved data have been deleted.");
+    } catch (error) { showToast(error.message, true); }
   }
 
   function fileBase64(file) {
@@ -1249,7 +1362,7 @@
 
   async function changePassword(event) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
-    if (form.get("newPassword") !== form.get("confirmPassword")) { showToast("The two new local passwords do not match.", true); return; }
+    if (form.get("newPassword") !== form.get("confirmPassword")) { showToast("The two new passwords do not match.", true); return; }
     try { await api("/api/auth/password", { method: "POST", body: JSON.stringify({ currentPassword: form.get("currentPassword"), newPassword: form.get("newPassword") }) }); event.currentTarget.reset(); showToast("Your My Library password has been updated."); } catch (error) { showToast(error.message, true); }
   }
 

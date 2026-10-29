@@ -1,0 +1,8 @@
+# User data, uploads, credentials, and runtime artifacts
+/storage/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.DS_Store

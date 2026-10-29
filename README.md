@@ -70,9 +70,9 @@ MyLibrary-clean-release/
 ├── backend/                  # Python source for accounts, uploads, and AI
 │   ├── server.py
 │   └── requirements.txt
-├── migrations/               # Future Postgres schema; no personal data
+├── migrations/               # PostgreSQL schema applied by hosted startup
 │   └── 001_initial_schema.sql
-├── cloud/                    # Portable staging container and cloud notes
+├── cloud/                    # Hosted container and deployment checklist
 │   ├── Dockerfile
 │   └── README.md
 ├── .github/workflows/        # Source verification when pushed to GitHub
@@ -87,17 +87,12 @@ ignored by Git and should never be edited or treated as a deployment file.
 
 ## Cloud-readiness status
 
-The structure is now ready for GitHub collaboration and a staged cloud
-migration, but this release remains intentionally local-first: it uses a local
-JSON file and local uploads so it works offline after setup. A public cloud
-launch requires the four replacements documented in [cloud/README.md](cloud/README.md):
+The normal launcher remains local-first. The hosted container can use managed
+PostgreSQL, private S3-compatible object storage, database-backed sessions, and
+a host-injected encryption key when all required environment variables are
+configured. No cloud account or public URL is configured in this repository;
+follow [cloud/README.md](cloud/README.md) before deploying.
 
-1. local JSON → managed Postgres database;
-2. local upload folder → private object storage;
-3. in-memory login sessions → persistent secure sessions;
-4. local encryption file → host secret manager.
-
-The migration files are a schema blueprint, not a live database connection.
-They contain table definitions only and do not send, copy, or expose any
-existing `storage/` data. Keep `storage/` out of GitHub; a fresh clone starts
-with a blank workspace as intended.
+Hosted deployment starts with an empty database and bucket. It does not import
+or upload an existing `storage/` directory. Keep that folder out of GitHub and
+plan any data import separately.

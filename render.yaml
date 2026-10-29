@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: my-library
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./cloud/Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: MY_LIBRARY_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: my-library-db
+          property: connectionString
+      - key: DATABASE_SSLMODE
+        value: require
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_SERVER_SIDE_ENCRYPTION
+        value: NONE
+      - key: AWS_REGION
+        value: auto
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: MY_LIBRARY_ENCRYPTION_KEY
+        sync: false
+
+databases:
+  - name: my-library-db
+    databaseName: my_library
+    user: my_library
+    plan: basic-256mb
+    region: oregon

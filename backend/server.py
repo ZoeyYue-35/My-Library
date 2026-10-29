@@ -25,6 +25,7 @@ import zipfile
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -36,6 +37,21 @@ import xml.etree.ElementTree as ET
 
 import certifi
 from cryptography.fernet import Fernet, InvalidToken
+from cloud_adapters import (
+    PrivateObjectStore,
+    StorageConflictError,
+    apply_schema_migrations,
+    cloud_database_enabled,
+    cloud_objects_enabled,
+    cloud_session_user,
+    create_cloud_session,
+    delete_cloud_session,
+    delete_cloud_user_sessions,
+    find_cloud_account_by_email,
+    load_cloud_database,
+    save_cloud_database,
+    validate_cloud_configuration,
+)
 
 
 # ``PROJECT_ROOT`` is intentionally separate from the backend source folder.
@@ -55,6 +71,8 @@ MAX_STORY_CONTEXT = 18_000
 PASSWORD_ROUNDS = 200_000
 SESSIONS: dict[str, str] = {}
 LOCK = threading.Lock()
+OBJECT_STORE: PrivateObjectStore | None = None
+OBJECT_STORE_LOCK = threading.Lock()
 
 # A workspace must not silently assume somebody else's career directions. Older
 # accounts keep the tracks stored with their account; new accounts start here.
@@ -138,13 +156,17 @@ def blank_database() -> dict[str, Any]:
 
 
 def ensure_storage() -> None:
+    if cloud_database_enabled():
+        return
     STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     if not DATABASE_PATH.exists():
         save_database(blank_database())
 
 
-def load_database() -> dict[str, Any]:
+def load_database(user_id: str | None = None) -> dict[str, Any]:
+    if cloud_database_enabled():
+        return load_cloud_database(user_id)
     ensure_storage()
     try:
         data = json.loads(DATABASE_PATH.read_text(encoding="utf-8"))
@@ -159,6 +181,9 @@ def load_database() -> dict[str, Any]:
 
 
 def save_database(data: dict[str, Any]) -> None:
+    if cloud_database_enabled():
+        save_cloud_database(data)
+        return
     STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
     temporary = DATABASE_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -207,6 +232,8 @@ def encrypted_store_key() -> bytes:
     provided = os.environ.get("MY_LIBRARY_ENCRYPTION_KEY", "").strip()
     if provided:
         return provided.encode("ascii", errors="strict")
+    if cloud_database_enabled():
+        raise ValueError("Set MY_LIBRARY_ENCRYPTION_KEY using the hosting platform's secret manager.")
     ensure_storage()
     try:
         if ENCRYPTION_KEY_PATH.exists():
@@ -234,6 +261,70 @@ def account_cipher() -> Fernet:
         raise ValueError(
             "MY_LIBRARY_ENCRYPTION_KEY is invalid. Use a Fernet key from a secure secret manager, then restart My Library."
         ) from error
+
+
+def get_object_store() -> PrivateObjectStore:
+    global OBJECT_STORE
+    if OBJECT_STORE is None:
+        with OBJECT_STORE_LOCK:
+            if OBJECT_STORE is None:
+                OBJECT_STORE = PrivateObjectStore()
+    return OBJECT_STORE
+
+
+def store_uploaded_file(user_id: str, stored_name: str, payload: bytes, content_type: str) -> str:
+    if cloud_objects_enabled():
+        return get_object_store().put(user_id, stored_name, payload, content_type)
+    user_directory = UPLOAD_ROOT / user_id
+    user_directory.mkdir(parents=True, exist_ok=True)
+    (user_directory / stored_name).write_bytes(payload)
+    return stored_name
+
+
+def read_uploaded_file(user_id: str, stored_name: str) -> bytes:
+    if cloud_objects_enabled():
+        return get_object_store().get(stored_name)
+    return (UPLOAD_ROOT / user_id / stored_name).read_bytes()
+
+
+def delete_uploaded_file(user_id: str, stored_name: str) -> None:
+    if not stored_name:
+        return
+    if cloud_objects_enabled():
+        get_object_store().delete(stored_name)
+        return
+    path = UPLOAD_ROOT / user_id / stored_name
+    if path.is_file():
+        path.unlink()
+
+
+def create_session(token: str, user_id: str) -> None:
+    if cloud_database_enabled():
+        create_cloud_session(token, user_id)
+    else:
+        SESSIONS[token] = user_id
+
+
+def session_user(token: str) -> str | None:
+    if cloud_database_enabled():
+        return cloud_session_user(token)
+    return SESSIONS.get(token)
+
+
+def revoke_session(token: str) -> None:
+    if cloud_database_enabled():
+        delete_cloud_session(token)
+    else:
+        SESSIONS.pop(token, None)
+
+
+def revoke_user_sessions(user_id: str) -> None:
+    if cloud_database_enabled():
+        delete_cloud_user_sessions(user_id)
+    else:
+        for token, owner_id in list(SESSIONS.items()):
+            if owner_id == user_id:
+                SESSIONS.pop(token, None)
 
 
 def public_ai_connection(account: dict[str, Any]) -> dict[str, Any]:
@@ -824,23 +915,50 @@ class LibraryHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for header_name, header_value in getattr(self, "response_headers", {}).items():
+            self.send_header(header_name, header_value)
+        self.response_headers = {}
         self.end_headers()
         self.wfile.write(body)
+
+    def set_session_cookie(self, token: str | None) -> None:
+        cookie = SimpleCookie()
+        cookie["my-library-session"] = token or ""
+        morsel = cookie["my-library-session"]
+        morsel["path"] = "/"
+        morsel["httponly"] = True
+        morsel["samesite"] = "Lax"
+        if cloud_database_enabled() or os.environ.get("MY_LIBRARY_ENV", "").strip().lower() == "production":
+            morsel["secure"] = True
+        morsel["max-age"] = str(30 * 24 * 60 * 60) if token else "0"
+        self.response_headers = {"Set-Cookie": morsel.OutputString()}
+
+    def request_session_token(self) -> str:
+        header_token = self.headers.get("X-Session-Token", "")
+        if header_token:
+            return header_token
+        cookies = SimpleCookie()
+        try:
+            cookies.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return ""
+        session_cookie = cookies.get("my-library-session")
+        return session_cookie.value if session_cookie else ""
 
     def send_error_json(self, status: int, message: str) -> None:
         self.send_json(status, {"ok": False, "error": message})
 
     def session_account(self, required: bool = True) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        token = self.headers.get("X-Session-Token", "")
-        owner_id = SESSIONS.get(token)
+        token = self.request_session_token()
+        owner_id = session_user(token)
         if not owner_id:
             if required:
                 self.send_error_json(HTTPStatus.UNAUTHORIZED, "Please sign in to access this library.")
             return None, None
-        data = load_database()
+        data = load_database(owner_id)
         account = next((entry for entry in data["accounts"] if entry["id"] == owner_id), None)
         if not account:
-            SESSIONS.pop(token, None)
+            revoke_session(token)
             if required:
                 self.send_error_json(HTTPStatus.UNAUTHORIZED, "Your local session has expired. Please sign in again.")
             return None, None
@@ -849,11 +967,26 @@ class LibraryHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self.send_json(HTTPStatus.OK, {"ok": True, "service": "my-library", "mode": "local-json"})
+            self.send_json(HTTPStatus.OK, {
+                "ok": True,
+                "service": "my-library",
+                "mode": "cloud" if cloud_database_enabled() else "local-json",
+            })
             return
         if parsed.path == "/api/session":
             account, _ = self.session_account(required=False)
             self.send_json(HTTPStatus.OK, {"ok": True, "account": account_public(account) if account else None})
+            return
+        if parsed.path == "/api/user-state":
+            account, _ = self.session_account()
+            if not account:
+                return
+            workspace_state = account.get("workspaceState") or {}
+            self.send_json(HTTPStatus.OK, {
+                "ok": True,
+                "storyJobDescription": account.get("storyJobDescription", ""),
+                "workspaceState": workspace_state if isinstance(workspace_state, dict) else {},
+            })
             return
         if parsed.path == "/api/library":
             account, data = self.session_account()
@@ -918,9 +1051,15 @@ class LibraryHandler(SimpleHTTPRequestHandler):
             elif parsed.path == "/api/ai/connection":
                 self.save_ai_connection()
             elif parsed.path == "/api/auth/logout":
-                token = self.headers.get("X-Session-Token", "")
-                SESSIONS.pop(token, None)
+                token = self.request_session_token()
+                revoke_session(token)
+                if cloud_database_enabled():
+                    self.set_session_cookie(None)
                 self.send_json(HTTPStatus.OK, {"ok": True})
+            elif parsed.path == "/api/auth/account":
+                self.delete_account()
+            elif parsed.path == "/api/user-state":
+                self.update_user_state()
             elif parsed.path == "/api/library/upload":
                 self.upload_item()
             elif parsed.path == "/api/library/text":
@@ -955,6 +1094,8 @@ class LibraryHandler(SimpleHTTPRequestHandler):
                 self.merge_experience(unquote(parsed.path.split("/")[-2]))
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown endpoint.")
+        except StorageConflictError as error:
+            self.send_error_json(HTTPStatus.CONFLICT, str(error))
         except ValueError as error:
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(error))
         except Exception as error:  # Keeps the local UI responsive if a file parser fails.
@@ -970,6 +1111,8 @@ class LibraryHandler(SimpleHTTPRequestHandler):
                 self.update_experience(unquote(parsed.path.rsplit("/", 1)[-1]))
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown endpoint.")
+        except StorageConflictError as error:
+            self.send_error_json(HTTPStatus.CONFLICT, str(error))
         except ValueError as error:
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(error))
 
@@ -990,6 +1133,8 @@ class LibraryHandler(SimpleHTTPRequestHandler):
                 self.delete_track(unquote(parsed.path.rsplit("/", 1)[-1]))
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown endpoint.")
+        except StorageConflictError as error:
+            self.send_error_json(HTTPStatus.CONFLICT, str(error))
         except ValueError as error:
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(error))
 
@@ -1005,9 +1150,14 @@ class LibraryHandler(SimpleHTTPRequestHandler):
         if len(password) < 8:
             raise ValueError("Choose a password with at least 8 characters.")
         with LOCK:
-            data = load_database()
-            if any(account["email"] == email for account in data["accounts"]):
-                raise ValueError("An account with that email already exists. Choose Sign in and use the local password you created for My Library.")
+            if cloud_database_enabled():
+                if find_cloud_account_by_email(email):
+                    raise ValueError("An account with that email already exists. Choose Sign in to continue.")
+                data = blank_database()
+            else:
+                data = load_database()
+                if any(account["email"] == email for account in data["accounts"]):
+                    raise ValueError("An account with that email already exists. Choose Sign in to continue.")
             account = {
                 "id": f"usr_{uuid.uuid4().hex}",
                 "name": name,
@@ -1022,26 +1172,83 @@ class LibraryHandler(SimpleHTTPRequestHandler):
                 "createdAt": now(),
             }
             data["accounts"].append(account)
-            save_database(data)
+            try:
+                save_database(data)
+            except Exception:
+                if cloud_database_enabled() and find_cloud_account_by_email(email):
+                    raise ValueError("An account with that email already exists. Choose Sign in to continue.") from None
+                raise
         token = secrets.token_urlsafe(32)
-        SESSIONS[token] = account["id"]
-        self.send_json(HTTPStatus.CREATED, {"ok": True, "token": token, "account": account_public(account)})
+        create_session(token, account["id"])
+        response = {"ok": True, "account": account_public(account)}
+        if cloud_database_enabled():
+            self.set_session_cookie(token)
+        else:
+            response["token"] = token
+        self.send_json(HTTPStatus.CREATED, response)
+
+    def update_user_state(self) -> None:
+        account, data = self.session_account()
+        if not account or not data:
+            return
+        payload = read_json(self)
+        if "storyJobDescription" in payload:
+            account["storyJobDescription"] = str(payload.get("storyJobDescription") or "")[:16_000]
+        if "workspaceState" in payload:
+            workspace_state = payload.get("workspaceState")
+            if not isinstance(workspace_state, dict):
+                raise ValueError("Workspace state must be an object.")
+            if len(json.dumps(workspace_state, ensure_ascii=False).encode("utf-8")) > 500_000:
+                raise ValueError("Workspace drafts exceed the 500 KB limit.")
+            account["workspaceState"] = workspace_state
+        with LOCK:
+            save_database(data)
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def delete_account(self) -> None:
+        account, data = self.session_account()
+        if not account or not data:
+            return
+        payload = read_json(self)
+        if not password_matches(str(payload.get("password") or ""), account.get("passwordHash", "")):
+            raise ValueError("The password does not match this account.")
+        user_id = account["id"]
+        user_items = [item for item in data["items"] if item.get("ownerId") == user_id]
+        for item in user_items:
+            delete_uploaded_file(user_id, item.get("storedName", ""))
+        for collection in ("items", "experiences", "stories", "mockHistories"):
+            data[collection] = [entry for entry in data[collection] if entry.get("ownerId") != user_id]
+        data["accounts"] = [entry for entry in data["accounts"] if entry.get("id") != user_id]
+        with LOCK:
+            save_database(data)
+        revoke_user_sessions(user_id)
+        if cloud_database_enabled():
+            self.set_session_cookie(None)
+        self.send_json(HTTPStatus.OK, {"ok": True})
 
     def login(self) -> None:
         payload = read_json(self)
         email = clean_text(payload.get("email")).lower()
         password = str(payload.get("password") or "")
-        data = load_database()
-        account = next((entry for entry in data["accounts"] if entry["email"] == email), None)
+        if cloud_database_enabled():
+            account = find_cloud_account_by_email(email)
+        else:
+            data = load_database()
+            account = next((entry for entry in data["accounts"] if entry["email"] == email), None)
         if not account:
-            self.send_error_json(HTTPStatus.UNAUTHORIZED, "No local My Library account matches this email. Choose Create account if this is your first visit.")
+            self.send_error_json(HTTPStatus.UNAUTHORIZED, "No My Library account matches this email. Choose Create account if this is your first visit.")
             return
         if not password_matches(password, account.get("passwordHash", "")):
-            self.send_error_json(HTTPStatus.UNAUTHORIZED, "That local password does not match this account. It is separate from your ChatGPT or browser password.")
+            self.send_error_json(HTTPStatus.UNAUTHORIZED, "That password does not match this account. It is separate from your ChatGPT or browser password.")
             return
         token = secrets.token_urlsafe(32)
-        SESSIONS[token] = account["id"]
-        self.send_json(HTTPStatus.OK, {"ok": True, "token": token, "account": account_public(account)})
+        create_session(token, account["id"])
+        response = {"ok": True, "account": account_public(account)}
+        if cloud_database_enabled():
+            self.set_session_cookie(token)
+        else:
+            response["token"] = token
+        self.send_json(HTTPStatus.OK, response)
 
     def complete_onboarding(self) -> None:
         account, data = self.session_account()
@@ -1065,15 +1272,15 @@ class LibraryHandler(SimpleHTTPRequestHandler):
         current_password = str(payload.get("currentPassword") or "")
         new_password = str(payload.get("newPassword") or "")
         if not password_matches(current_password, account.get("passwordHash", "")):
-            raise ValueError("Your current local password is not correct.")
+            raise ValueError("Your current password is not correct.")
         if len(new_password) < 8:
-            raise ValueError("Choose a new local password with at least 8 characters.")
+            raise ValueError("Choose a new password with at least 8 characters.")
         if current_password == new_password:
             raise ValueError("Choose a different new password.")
         with LOCK:
             saved_account = next((entry for entry in data["accounts"] if entry.get("id") == account["id"]), None)
             if not saved_account:
-                raise ValueError("This local account no longer exists.")
+                raise ValueError("This account no longer exists.")
             saved_account["passwordHash"] = make_password_hash(new_password)
             save_database(data)
         self.send_json(HTTPStatus.OK, {"ok": True})
@@ -1105,7 +1312,7 @@ class LibraryHandler(SimpleHTTPRequestHandler):
         with LOCK:
             saved_account = next((entry for entry in data["accounts"] if entry.get("id") == account["id"]), None)
             if not saved_account:
-                raise ValueError("This local account no longer exists.")
+                raise ValueError("This account no longer exists.")
             saved_account["aiConnection"] = connection
             save_database(data)
         self.send_json(HTTPStatus.OK, {"ok": True, "account": account_public(saved_account)})
@@ -1117,7 +1324,7 @@ class LibraryHandler(SimpleHTTPRequestHandler):
         with LOCK:
             saved_account = next((entry for entry in data["accounts"] if entry.get("id") == account["id"]), None)
             if not saved_account:
-                raise ValueError("This local account no longer exists.")
+                raise ValueError("This account no longer exists.")
             saved_account.pop("aiConnection", None)
             save_database(data)
         self.send_json(HTTPStatus.OK, {"ok": True, "account": account_public(saved_account)})
@@ -1150,10 +1357,9 @@ class LibraryHandler(SimpleHTTPRequestHandler):
         note = clean_text(payload.get("note"), 2_000)
         text, extraction_status = extract_text(filename, file_data)
         item_id = f"item_{uuid.uuid4().hex}"
-        user_directory = UPLOAD_ROOT / account["id"]
-        user_directory.mkdir(parents=True, exist_ok=True)
         stored_name = f"{item_id}{extension}"
-        (user_directory / stored_name).write_bytes(file_data)
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        storage_key = store_uploaded_file(account["id"], stored_name, file_data, mime_type)
         item = {
             "id": item_id,
             "ownerId": account["id"],
@@ -1162,8 +1368,8 @@ class LibraryHandler(SimpleHTTPRequestHandler):
             "trackId": track_id,
             "note": note,
             "filename": filename,
-            "storedName": stored_name,
-            "mimeType": mimetypes.guess_type(filename)[0] or "application/octet-stream",
+            "storedName": storage_key,
+            "mimeType": mime_type,
             "size": len(file_data),
             "text": text[:180_000],
             "extractionStatus": extraction_status,
@@ -1173,7 +1379,11 @@ class LibraryHandler(SimpleHTTPRequestHandler):
         with LOCK:
             data["items"].append(item)
             attach_experience_candidates(data, item)
-            save_database(data)
+            try:
+                save_database(data)
+            except Exception:
+                delete_uploaded_file(account["id"], storage_key)
+                raise
         self.send_json(HTTPStatus.CREATED, {"ok": True, "item": item_public(item, account)})
 
     def add_text_item(self) -> None:
@@ -1234,9 +1444,6 @@ class LibraryHandler(SimpleHTTPRequestHandler):
         item = next((entry for entry in data["items"] if entry["id"] == item_id and entry["ownerId"] == account["id"]), None)
         if not item:
             raise ValueError("That library item no longer exists.")
-        file_path = UPLOAD_ROOT / account["id"] / item.get("storedName", "")
-        if item.get("storedName") and file_path.exists() and file_path.is_file():
-            file_path.unlink()
         data["items"] = [entry for entry in data["items"] if entry["id"] != item_id]
         for experience in data["experiences"]:
             experience["sourceItemIds"] = [source for source in experience.get("sourceItemIds", []) if source != item_id]
@@ -1245,6 +1452,7 @@ class LibraryHandler(SimpleHTTPRequestHandler):
                 account["currentResumeByTrack"].pop(track, None)
         with LOCK:
             save_database(data)
+        delete_uploaded_file(account["id"], item.get("storedName", ""))
         self.send_json(HTTPStatus.OK, {"ok": True})
 
     def set_current_resume(self) -> None:
@@ -1906,28 +2114,36 @@ COMPLETED ROUNDS:\n""" + json.dumps(sanitized, ensure_ascii=False)
         if not item or not item.get("storedName"):
             self.send_error_json(HTTPStatus.NOT_FOUND, "File not found.")
             return
-        path = UPLOAD_ROOT / account["id"] / item["storedName"]
-        if not path.is_file():
+        try:
+            file_data = read_uploaded_file(account["id"], item["storedName"])
+        except FileNotFoundError:
             self.send_error_json(HTTPStatus.NOT_FOUND, "This uploaded file is no longer available.")
             return
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", item.get("mimeType", "application/octet-stream"))
         self.send_header("Content-Disposition", f'attachment; filename="{safe_filename(item.get("filename", "download"))}"')
-        self.send_header("Content-Length", str(path.stat().st_size))
+        self.send_header("Content-Length", str(len(file_data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        with path.open("rb") as file_handle:
-            shutil.copyfileobj(file_handle, self.wfile)
+        self.wfile.write(file_data)
 
 
 def main() -> None:
+    validate_cloud_configuration()
     ensure_storage()
+    if cloud_database_enabled():
+        apply_schema_migrations()
+        account_cipher()
+        get_object_store().client.head_bucket(Bucket=os.environ["S3_BUCKET"])
     port = int(os.environ.get("MY_LIBRARY_PORT", os.environ.get("PORT", "8010")))
     host = os.environ.get("MY_LIBRARY_HOST", "127.0.0.1")
     server = ThreadingHTTPServer((host, port), LibraryHandler)
     visible_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     print(f"My Library is running at http://{visible_host}:{port}")
-    print(f"Local accounts and uploads stay in {STORAGE_ROOT}")
+    if cloud_database_enabled():
+        print("Accounts and uploads use managed PostgreSQL and private object storage")
+    else:
+        print(f"Local accounts and uploads stay in {STORAGE_ROOT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
