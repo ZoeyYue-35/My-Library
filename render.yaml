@@ -2,7 +2,7 @@ services:
   - type: web
     name: my-library
     runtime: docker
-    plan: starter
+    plan: free
     region: oregon
     dockerfilePath: ./cloud/Dockerfile
     dockerContext: .
@@ -11,9 +11,7 @@ services:
       - key: MY_LIBRARY_ENV
         value: production
       - key: DATABASE_URL
-        fromDatabase:
-          name: my-library-db
-          property: connectionString
+        sync: false
       - key: DATABASE_SSLMODE
         value: require
       - key: S3_ENDPOINT_URL
@@ -30,10 +28,3 @@ services:
         sync: false
       - key: MY_LIBRARY_ENCRYPTION_KEY
         sync: false
-
-databases:
-  - name: my-library-db
-    databaseName: my_library
-    user: my_library
-    plan: basic-256mb
-    region: oregon
