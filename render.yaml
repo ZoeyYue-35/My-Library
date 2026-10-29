@@ -21,7 +21,7 @@ services:
       - key: S3_SERVER_SIDE_ENCRYPTION
         value: NONE
       - key: AWS_REGION
-        value: auto
+        sync: false
       - key: AWS_ACCESS_KEY_ID
         sync: false
       - key: AWS_SECRET_ACCESS_KEY
