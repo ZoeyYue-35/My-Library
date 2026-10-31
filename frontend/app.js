@@ -220,39 +220,54 @@
   }
 
   function renderShell(content) {
-    app.innerHTML = '<div class="app-shell' + (state.onboardingStep === 0 ? ' onboarding-story-nav-step' : '') + '"><aside class="sidebar"><div class="wordmark"><span class="wordmark-mark">M</span><strong>My<span>Library</span></strong></div><p class="side-section-title">PERSONAL WORKSPACE</p><nav class="nav">' +
+    app.innerHTML = '<div class="app-shell"><aside class="sidebar"><div class="wordmark"><span class="wordmark-mark">M</span><strong>My<span>Library</span></strong></div><p class="side-section-title">PERSONAL WORKSPACE</p><nav class="nav">' +
       navButton("studio", "⌘", "Resume studio") +
       navButton("library", "◇", "Knowledge library") +
       navButton("story", "✦", "Story builder") +
       '</nav><div class="side-note"><span class="online-dot"></span><strong>Saved on this browser</strong><p>Nothing becomes your current resume or a reusable story without your confirmation.</p></div></aside><section class="content">' + content + '</section></div>' + onboardingOverlay();
-    const storyNav = document.querySelector('[data-nav="story"]');
-    if (storyNav && state.onboardingStep === 0) storyNav.classList.add("onboarding-target");
+    const targetSelector = onboardingTargetSelector();
+    const target = targetSelector ? document.querySelector(targetSelector) : null;
+    if (target) {
+      target.classList.add("onboarding-target");
+      window.requestAnimationFrame(function () {
+        target.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+      });
+    }
     bindShell();
+  }
+
+  function onboardingTargetSelector() {
+    if (state.onboardingStep === 1) return "#studio-track-form";
+    if (state.onboardingStep === 2) return ".studio-upload";
+    if (state.onboardingStep === 3) return document.querySelector("[data-make-current]") ? "[data-make-current]" : ".studio-main";
+    if (state.onboardingStep === 4) return ".knowledge-heading";
+    if (state.onboardingStep === 5) return '[data-launch-story="star"]';
+    if (state.onboardingStep === 6) return '[data-story-tool="star"]';
+    if (state.onboardingStep === 7) return '[data-story-tool="mock"]';
+    return "";
   }
 
   function onboardingOverlay() {
     if (!state.account || state.onboardingStep < 0 || !state.account.showOnboarding) return "";
     const steps = [
-      { number: "01", title: "Start with Story Builder", body: "This is your interview workspace. Use it when you want to turn your saved material into an answer or practice a real interview.", action: "Open Story Builder" },
-      { number: "02", title: "Build one STAR story", body: "Ask a behavioral question and the coach finds the strongest supported experience from your Knowledge Library. You can edit every draft before confirming it.", action: "Show Mock Interview" },
-      { number: "03", title: "Practice a Mock Interview", body: "Use a job description to generate five tailored questions, voice or type your answers, and keep the complete scorecard in Mock history.", action: "Finish guide" },
+      { number: "01", title: "Welcome to My Library", body: "Are you ready to add your resume and career experience, build your stories, and practice with a mock interview coach? This quick tour will show you where to begin.", action: "Next" },
+      { number: "02", title: "Create your resume tracks", body: "Start by creating separate tracks for different roles or career directions. Each track keeps its own resume versions and current resume.", action: "Next" },
+      { number: "03", title: "Upload resume versions", body: "Upload different versions of your resume into the selected track. They stay in your version history so older drafts are not overwritten.", action: "Next" },
+      { number: "04", title: "Choose a current resume", body: "Select one version and set it as current. Story Builder uses that resume as a reference alongside your Knowledge Library.", action: "Next" },
+      { number: "05", title: "Build your Knowledge Library", body: "Organize materials from your work and career across tracks. My Library reads supported files so Story Builder can use them as a factual source library.", action: "Next" },
+      { number: "06", title: "Start a Story", body: "In Story Builder, begin with a behavioral question. The coach uses your current resume and Knowledge Library to prepare a draft you can review.", action: "Next" },
+      { number: "07", title: "Coach: build a STAR answer", body: "The STAR coach finds relevant evidence and drafts an answer. You can edit it, ask for a revision, and confirm it when it is ready.", action: "Next" },
+      { number: "08", title: "Coach: practice a mock interview", body: "Mock Interview asks role-aware questions, supports typed or recorded answers, and saves completed sessions to your history.", action: "Next" },
     ];
     const step = steps[state.onboardingStep] || steps[0];
-    return '<div class="onboarding-backdrop" role="presentation"><section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="onboarding-title"><div class="onboarding-progress"><span>QUICK TOUR</span><strong>' + step.number + ' / 03</strong></div><div class="onboarding-dots" aria-hidden="true"><i class="' + (state.onboardingStep === 0 ? "active" : "") + '"></i><i class="' + (state.onboardingStep === 1 ? "active" : "") + '"></i><i class="' + (state.onboardingStep === 2 ? "active" : "") + '"></i></div><h2 id="onboarding-title">' + escapeHtml(step.title) + '</h2><p>' + escapeHtml(step.body) + '</p><div class="onboarding-actions"><button class="link-action" type="button" data-skip-onboarding>Skip guide</button><button class="primary" type="button" data-next-onboarding>' + escapeHtml(step.action) + '</button></div></section></div>';
+    const dots = steps.map(function (_, index) { return '<i class="' + (state.onboardingStep === index ? "active" : "") + '"></i>'; }).join("");
+    const progressTitle = state.onboardingStep === 0 ? "WELCOME TO MY LIBRARY" : "GETTING STARTED";
+    return '<div class="onboarding-backdrop" role="presentation"><section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="onboarding-title"><div class="onboarding-progress"><span>' + progressTitle + '</span><strong>' + step.number + ' / ' + String(steps.length).padStart(2, "0") + '</strong></div><div class="onboarding-dots" aria-hidden="true">' + dots + '</div><h2 id="onboarding-title">' + escapeHtml(step.title) + '</h2><p>' + escapeHtml(step.body) + '</p><div class="onboarding-actions"><button class="link-action" type="button" data-skip-onboarding>Skip</button><button class="primary" type="button" data-next-onboarding>Next</button></div></section></div>';
   }
 
   function bindShell() {
     document.querySelectorAll("[data-nav]").forEach(function (button) {
       button.addEventListener("click", function () {
-        if (state.onboardingStep === 0) {
-          if (button.dataset.nav === "story") {
-            state.view = "story";
-            state.storyTool = "star";
-            state.onboardingStep = 1;
-            render();
-          }
-          return;
-        }
         if (state.onboardingStep >= 0) return;
         if (state.view === "story" && button.dataset.nav !== "story" && state.mockRecorder) stopMockRecording(true);
         state.view = button.dataset.nav; state.modalItem = null; render();
@@ -505,8 +520,8 @@
   }
 
   function storyToolTabs() {
-    const starClass = (state.storyTool === "star" ? "active" : "") + (state.onboardingStep === 1 ? " onboarding-target" : "");
-    const mockClass = (state.storyTool === "mock" ? "active" : "") + (state.onboardingStep === 2 ? " onboarding-target" : "");
+    const starClass = state.storyTool === "star" ? "active" : "";
+    const mockClass = state.storyTool === "mock" ? "active" : "";
     return '<div class="story-tool-tabs" role="tablist" aria-label="Story Builder tools"><button type="button" role="tab" aria-selected="' + (state.storyTool === "star" ? "true" : "false") + '" class="' + starClass + '" data-story-tool="star"><strong>Build a STAR answer</strong><span>Turn one real experience into a reviewable story.</span></button><button type="button" role="tab" aria-selected="' + (state.storyTool === "mock" ? "true" : "false") + '" class="' + mockClass + '" data-story-tool="mock"><strong>Mock interview</strong><span>Practice adaptive questions, follow-ups, and feedback.</span></button></div>';
   }
 
@@ -601,13 +616,18 @@
     queueWorkspaceStateSave();
     document.querySelectorAll("[data-story-tool]").forEach(function (button) { button.addEventListener("click", function () {
       if (state.storyPending) return;
-      if (state.onboardingStep === 1 && button.dataset.storyTool === "star") { advanceOnboarding(); return; }
-      if (state.onboardingStep === 2 && button.dataset.storyTool === "mock") { finishOnboarding(); return; }
+      if (state.onboardingStep === 6 && button.dataset.storyTool === "star") { advanceOnboarding(); return; }
+      if (state.onboardingStep === 7 && button.dataset.storyTool === "mock") { finishOnboarding(); return; }
       if (state.onboardingStep >= 0) return;
       state.selectedMockHistory = null; state.storyTool = button.dataset.storyTool; state.storyLaunchMenu = false; render();
     }); });
     document.querySelectorAll("[data-open-story-launcher]").forEach(function (button) { button.addEventListener("click", openStoryLauncher); });
-    document.querySelectorAll("[data-launch-story]").forEach(function (button) { button.addEventListener("click", function () { if (state.storyPending) return; state.selectedMockHistory = null; state.storyTool = button.dataset.launchStory; state.storyLaunchMenu = false; render(); }); });
+    document.querySelectorAll("[data-launch-story]").forEach(function (button) { button.addEventListener("click", function () {
+      if (state.storyPending) return;
+      if (state.onboardingStep === 5 && button.dataset.launchStory === "star") { advanceOnboarding(); return; }
+      if (state.onboardingStep >= 0) return;
+      state.selectedMockHistory = null; state.storyTool = button.dataset.launchStory; state.storyLaunchMenu = false; render();
+    }); });
     const jdField = document.getElementById("story-jd");
     if (jdField) jdField.addEventListener("input", function () { saveStoryJobDescription(jdField.value); });
     const clearJd = document.querySelector("[data-clear-jd]");
@@ -630,19 +650,25 @@
   }
 
   function advanceOnboarding() {
-    if (state.onboardingStep === 0) {
-      state.view = "story";
-      state.storyTool = "star";
-      state.storyLaunchMenu = false;
-      state.onboardingStep = 1;
-    } else if (state.onboardingStep === 1) {
-      state.view = "story";
-      state.storyTool = "mock";
-      state.storyLaunchMenu = false;
-      state.onboardingStep = 2;
-    } else {
+    const nextStep = state.onboardingStep + 1;
+    if (nextStep >= 8) {
       finishOnboarding();
       return;
+    }
+    state.onboardingStep = nextStep;
+    if (nextStep <= 3) {
+      state.view = "studio";
+      state.storyLaunchMenu = false;
+    } else if (nextStep === 4) {
+      state.view = "library";
+      state.knowledgeTab = "materials";
+      state.storyLaunchMenu = false;
+    } else {
+      state.view = "story";
+      state.storyTool = "star";
+      state.storyLaunchMenu = nextStep === 5;
+      state.selectedMockHistory = null;
+      if (nextStep === 7) state.storyTool = "mock";
     }
     render();
   }
