@@ -262,7 +262,7 @@
     const step = steps[state.onboardingStep] || steps[0];
     const dots = steps.map(function (_, index) { return '<i class="' + (state.onboardingStep === index ? "active" : "") + '"></i>'; }).join("");
     const progressTitle = state.onboardingStep === 0 ? "WELCOME TO MY LIBRARY" : "GETTING STARTED";
-    return '<div class="onboarding-backdrop" role="presentation"><section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="onboarding-title"><div class="onboarding-progress"><span>' + progressTitle + '</span><strong>' + step.number + ' / ' + String(steps.length).padStart(2, "0") + '</strong></div><div class="onboarding-dots" aria-hidden="true">' + dots + '</div><h2 id="onboarding-title">' + escapeHtml(step.title) + '</h2><p>' + escapeHtml(step.body) + '</p><div class="onboarding-actions"><button class="link-action" type="button" data-skip-onboarding>Skip</button><button class="primary" type="button" data-next-onboarding>Next</button></div></section></div>';
+    return '<div class="onboarding-backdrop" role="presentation"></div><section class="onboarding-card" role="dialog" aria-modal="true" aria-labelledby="onboarding-title"><div class="onboarding-progress"><span>' + progressTitle + '</span><strong>' + step.number + ' / ' + String(steps.length).padStart(2, "0") + '</strong></div><div class="onboarding-dots" aria-hidden="true">' + dots + '</div><h2 id="onboarding-title">' + escapeHtml(step.title) + '</h2><p>' + escapeHtml(step.body) + '</p><div class="onboarding-actions"><button class="link-action" type="button" data-skip-onboarding>Skip</button><button class="primary" type="button" data-next-onboarding>Next</button></div></section>';
   }
 
   function bindShell() {
